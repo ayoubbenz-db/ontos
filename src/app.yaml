@@ -37,6 +37,15 @@ env:
     value: "audit_logs"
     #value: "/Volumes/${workspace.env.DATABRICKS_CATALOG}/${workspace.env.DATABRICKS_SCHEMA}/${workspace.env.DATABRICKS_VOLUME}/audit_logs"
 
+  # --- Per-request user impersonation (test personas) ---
+  # SECURITY: leave DISABLED in production. Setting TEST_USER_TOKEN enables
+  # runtime identity override via X-Test-* headers. Uncomment and point at a
+  # secret to enable the persona picker in a deployment. Once enabled, the
+  # persona list can be customized (no repo change / restart) by dropping
+  # {DATABRICKS_VOLUME}/config/test_personas.yaml on the volume.
+  #- name: "TEST_USER_TOKEN"
+  #  valueFrom: "test-user-token"   # reference a Databricks App secret, not a literal
+
   - name: "LLM_ENABLED"
     value: "True"
   - name: "LLM_ENDPOINT"
