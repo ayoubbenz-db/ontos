@@ -103,18 +103,63 @@ def _invalidate_persona_cache() -> None:
     _cache_expires_at = 0.0
 
 
+def _resolve_volume_base(settings: Settings) -> Optional[str]:
+    """Normalize ``DATABRICKS_VOLUME`` into a base path for the override file.
+
+    ``DATABRICKS_VOLUME`` is written several ways across deployments, so we
+    accept all of them and prefer a ``/Volumes/...`` mount path:
+
+    - full mount path — ``/Volumes/<catalog>/<schema>/<volume>`` (what the
+      Databricks Apps ``volume`` resource injects via ``valueFrom``; preferred)
+    - dotted UC name — ``<catalog>.<schema>.<volume>``
+    - bare volume name — ``<volume>`` (combined here with ``DATABRICKS_CATALOG``
+      and ``DATABRICKS_SCHEMA``)
+    - a local filesystem path (dev)
+
+    Returns a ``/Volumes/...`` path when one can be synthesized (read via the
+    SDK Files API), otherwise the raw value (read from the local filesystem),
+    or ``None`` when unset.
+    """
+    raw = (settings.DATABRICKS_VOLUME or "").strip().rstrip("/")
+    if not raw:
+        return None
+
+    # Already a mount path.
+    if raw.startswith("/Volumes/"):
+        return raw
+
+    # Any other value carrying path separators is a filesystem path (dev). We
+    # only synthesize /Volumes/ paths from Unity Catalog names, never from paths.
+    if "/" in raw:
+        return raw
+
+    # Dotted UC name: catalog.schema.volume
+    parts = raw.split(".")
+    if len(parts) == 3 and all(parts):
+        return "/Volumes/" + "/".join(parts)
+
+    # Bare volume name: combine with the app's configured catalog + schema.
+    if "." not in raw:
+        catalog = getattr(settings, "DATABRICKS_CATALOG", None)
+        schema = getattr(settings, "DATABRICKS_SCHEMA", None)
+        if catalog and schema:
+            return f"/Volumes/{catalog}/{schema}/{raw}"
+
+    # Could not synthesize a mount path; treat as a local path (likely dev).
+    return raw
+
+
 def _read_volume_override(settings: Settings) -> Optional[str]:
     """Return the raw YAML text of the volume override, or None if absent.
 
-    ``DATABRICKS_VOLUME`` is injected as a full ``/Volumes/...`` path in a
-    Databricks Apps deployment. ``/Volumes`` is NOT a real filesystem mount in
-    that runtime, so reads must go through the SDK Files API — mirroring the
-    pattern used for PDF/document downloads elsewhere. For local development
-    ``DATABRICKS_VOLUME`` is typically a dotted placeholder (or unset), in which
-    case we treat it as a plain filesystem path (and it simply won't exist, so
-    we fall back to the bundled list).
+    The override lives at ``{DATABRICKS_VOLUME}/config/test_personas.yaml``.
+    ``/Volumes`` is NOT a real filesystem mount in the Databricks Apps runtime,
+    so those reads go through the SDK Files API — mirroring the pattern used for
+    PDF/document downloads elsewhere. A non-``/Volumes/`` base (local dev) is
+    read from the plain filesystem; if it doesn't exist we fall back to the
+    bundled list. See ``_resolve_volume_base`` for how the base is derived.
     """
-    base = (settings.DATABRICKS_VOLUME or "").rstrip("/")
+    base = _resolve_volume_base(settings)
     if not base:
         return None
 

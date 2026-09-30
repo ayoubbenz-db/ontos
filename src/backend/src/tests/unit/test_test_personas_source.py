@@ -47,9 +47,19 @@ def _clear_cache():
     tpr._invalidate_persona_cache()
 
 
-def _settings(volume: str | None) -> SimpleNamespace:
+def _settings(
+    volume: str | None,
+    *,
+    catalog: str | None = None,
+    schema: str | None = None,
+) -> SimpleNamespace:
     """Minimal stand-in exposing only the attributes _load_personas reads."""
-    return SimpleNamespace(DATABRICKS_VOLUME=volume, TEST_USER_TOKEN="tok")
+    return SimpleNamespace(
+        DATABRICKS_VOLUME=volume,
+        DATABRICKS_CATALOG=catalog,
+        DATABRICKS_SCHEMA=schema,
+        TEST_USER_TOKEN="tok",
+    )
 
 
 class TestVolumeOverride:
@@ -87,7 +97,7 @@ class TestVolumeOverride:
         assert any(p.id == "admin" for p in personas)
 
     def test_local_volume_override_file(self, tmp_path):
-        """A dotted/local DATABRICKS_VOLUME is read as a filesystem path."""
+        """A local filesystem DATABRICKS_VOLUME is read as a filesystem path."""
         override = tmp_path / "config" / "test_personas.yaml"
         override.parent.mkdir(parents=True)
         override.write_text(VOLUME_YAML)
@@ -95,6 +105,57 @@ class TestVolumeOverride:
         personas = tpr._load_personas(_settings(str(tmp_path)))
 
         assert [p.id for p in personas] == ["custom"]
+
+    def test_dotted_volume_name_resolved_to_mount_path(self):
+        """A dotted catalog.schema.volume is normalized to a /Volumes/ path."""
+        mock_resp = MagicMock()
+        mock_resp.contents = BytesIO(VOLUME_YAML.encode("utf-8"))
+        mock_ws = MagicMock()
+        mock_ws.files.download = MagicMock(return_value=mock_resp)
+
+        with patch(
+            "src.common.workspace_client.get_workspace_client",
+            return_value=mock_ws,
+        ):
+            personas = tpr._load_personas(_settings("cat.sch.vol"))
+
+        mock_ws.files.download.assert_called_once_with(
+            file_path="/Volumes/cat/sch/vol/config/test_personas.yaml"
+        )
+        assert [p.id for p in personas] == ["custom"]
+
+    def test_bare_volume_name_resolved_with_catalog_and_schema(self):
+        """A bare volume name is combined with DATABRICKS_CATALOG/SCHEMA."""
+        mock_resp = MagicMock()
+        mock_resp.contents = BytesIO(VOLUME_YAML.encode("utf-8"))
+        mock_ws = MagicMock()
+        mock_ws.files.download = MagicMock(return_value=mock_resp)
+
+        with patch(
+            "src.common.workspace_client.get_workspace_client",
+            return_value=mock_ws,
+        ):
+            personas = tpr._load_personas(
+                _settings("app_files", catalog="ayoub_catalog", schema="ontos_app")
+            )
+
+        mock_ws.files.download.assert_called_once_with(
+            file_path="/Volumes/ayoub_catalog/ontos_app/app_files/config/test_personas.yaml"
+        )
+        assert [p.id for p in personas] == ["custom"]
+
+    def test_bare_volume_name_without_catalog_schema_stays_local(self):
+        """A bare name with no catalog/schema is treated as a local path (no SDK)."""
+        mock_ws = MagicMock()
+        with patch(
+            "src.common.workspace_client.get_workspace_client",
+            return_value=mock_ws,
+        ):
+            personas = tpr._load_personas(_settings("app_files"))
+
+        # No /Volumes/ path could be synthesized → local read (miss) → bundled.
+        mock_ws.files.download.assert_not_called()
+        assert any(p.id == "admin" for p in personas)
 
 
 class TestBundledFallback:
