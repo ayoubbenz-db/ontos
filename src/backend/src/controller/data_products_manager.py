@@ -53,6 +53,8 @@ from src.models.data_products import (
     SubscribersListResponse,
     OnBehalfOf,
 )
+from src.models.import_results import BatchImportResult, ImportItemResult
+from src.common.entity_kind import classify_import_entity, describe_import_entity
 from src.models.users import UserInfo
 from src.repositories.data_products_repository import data_product_repo, subscription_repo
 from src.repositories.teams_repository import team_repo
@@ -1564,28 +1566,7 @@ class DataProductsManager(DeliveryMixin, SearchableAsset):
         """
         logger.info(f"Processing batch upload from file: {filename}")
 
-        # Parse file content
-        try:
-            if filename.endswith('.yaml') or filename.endswith('.yml'):
-                import yaml
-                data = yaml.safe_load(file_content)
-            elif filename.endswith('.json'):
-                import json
-                data = json.loads(file_content)
-            else:
-                raise ValueError(f"Unsupported file type: {filename}. Must be .yaml, .yml, or .json")
-        except yaml.YAMLError as e:
-            raise ValueError(f"Invalid YAML format: {e}")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON format: {e}")
-
-        # Normalize to list
-        if isinstance(data, dict):
-            data_list = [data]
-        elif isinstance(data, list):
-            data_list = data
-        else:
-            raise ValueError("File must contain a JSON object/array or YAML mapping/list of data products")
+        data_list = self._parse_products_content(file_content, filename)
 
         # Process each product
         created_products: List[DataProductApi] = []
@@ -1621,6 +1602,130 @@ class DataProductsManager(DeliveryMixin, SearchableAsset):
             f"{len(errors)} errors from {len(data_list)} total items"
         )
         return created_products, errors
+
+    @staticmethod
+    def _parse_products_content(file_content: bytes, filename: str) -> List[Dict[str, Any]]:
+        """Parse a single uploaded ODPS file into a list of product dicts.
+
+        A file may hold a single product object or a top-level array; a dict is
+        normalized to ``[dict]`` and a list is returned as-is.
+        """
+        import json
+        try:
+            if filename.endswith('.yaml') or filename.endswith('.yml'):
+                data = yaml.safe_load(file_content)
+            elif filename.endswith('.json'):
+                data = json.loads(file_content)
+            else:
+                raise ValueError(f"Unsupported file type: {filename}. Must be .yaml, .yml, or .json")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML format: {e}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {e}")
+
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return data
+        raise ValueError("File must contain a JSON object/array or YAML mapping/list of data products")
+
+    def create_products_from_files(
+        self,
+        files: List[tuple],
+        user: Optional[str] = None,
+    ) -> BatchImportResult:
+        """Import ODPS products from one or more uploaded files.
+
+        Args:
+            files: List of ``(filename, content_bytes)`` tuples. Each file may
+                contain a single product object or an array of them.
+            user: Username of the uploader (stamped as personal-draft owner).
+
+        Returns:
+            A :class:`BatchImportResult`. A file that cannot be parsed at all is
+            recorded as a single failed item; per-entity failures are captured
+            individually and never abort the batch.
+        """
+        result = BatchImportResult()
+        index = 0
+        for filename, content in files:
+            try:
+                data_list = self._parse_products_content(content, filename)
+            except ValueError as e:
+                result.add(ImportItemResult(
+                    index=index, source_file=filename, status="failed", message=str(e),
+                ))
+                index += 1
+                continue
+
+            # An empty array is a failed item (parity with the contract path), not a
+            # silent no-op that the UI renders as "0 imported successfully".
+            if not data_list:
+                result.add(ImportItemResult(
+                    index=index, source_file=filename, status="failed",
+                    message="File contained no data product entities",
+                ))
+                index += 1
+                continue
+
+            for product_data in data_list:
+                source_id = product_data.get('id') if isinstance(product_data, dict) else None
+                if not isinstance(product_data, dict):
+                    result.add(ImportItemResult(
+                        index=index, source_file=filename, status="failed",
+                        message="Entity is not an object/mapping",
+                    ))
+                    index += 1
+                    continue
+                # Only import a recognizable ODPS Data Product. An ODCS contract is
+                # routed to the right page; anything unrecognizable is skipped rather
+                # than imported as a junk product.
+                entity_kind = classify_import_entity(product_data)
+                if entity_kind != "product":
+                    if entity_kind == "contract":
+                        skip_msg = (
+                            f"Skipped: this is an {describe_import_entity(product_data)} "
+                            "(kind: DataContract), not a Data Product. "
+                            "Import it from the Data Contracts page."
+                        )
+                    else:
+                        skip_msg = (
+                            "Skipped: not a recognizable ODPS Data Product "
+                            "(expected kind: DataProduct or product ports)."
+                        )
+                    result.add(ImportItemResult(
+                        index=index, source_file=filename, source_id=source_id,
+                        name=product_data.get('name'), status="skipped", message=skip_msg,
+                    ))
+                    index += 1
+                    continue
+                try:
+                    created = self.create_product(
+                        product_data, user=user, preserve_source_id=True,
+                    )
+                    result.add(ImportItemResult(
+                        index=index, source_file=filename, source_id=source_id,
+                        entity_id=created.id, name=created.name, status="created",
+                    ))
+                except Exception as e:
+                    # Log full detail (may carry SQL/internal text); keep the
+                    # client-facing per-item message generic.
+                    logger.warning(
+                        "Failed to import product at batch index %d (file %s): %s",
+                        index, filename, e, exc_info=True,
+                    )
+                    result.add(ImportItemResult(
+                        index=index, source_file=filename, source_id=source_id,
+                        name=product_data.get('name'), status="failed",
+                        message="Could not import this data product. See server logs for details.",
+                    ))
+                index += 1
+
+        logger.info(
+            "Product batch import complete: %d created, %d skipped, %d failed (%d total)",
+            result.created, result.skipped, result.failed, result.total,
+        )
+        return result
 
     def create_new_version(self, original_product_id: str, request: NewVersionRequest) -> DataProductApi:
         """Creates a new version of an ODPS v1.0.0 data product."""
