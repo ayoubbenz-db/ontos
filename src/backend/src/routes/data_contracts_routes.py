@@ -87,8 +87,10 @@ def get_jobs_manager(request: Request):
 
 @router.get('/data-contracts', response_model=list[DataContractSummary])
 async def get_contracts(
+    request: Request,
     db: DBSessionDep,
     domain_id: Optional[str] = None,
+    domain_ids: Optional[str] = None,
     project_id: Optional[str] = None,
     status: Optional[str] = None,
     include_history: bool = False,
@@ -109,12 +111,21 @@ async def get_contracts(
     is already permitted to see.
     """
     try:
-        # Check if user is admin
-        from src.common.authorization import is_user_admin
-        from src.common.config import get_settings
-        settings = get_settings()
+        # Determine admin via the role-aware check, not just workspace-group
+        # membership. A user whose admin rights come from an Ontos role (rather
+        # than the workspace ``admins`` group) must still bypass the PRD #442
+        # visibility filter — exactly as the data-products listing does. The
+        # narrower ``is_user_admin`` used here previously let such role-based
+        # admins fall through to consumer visibility, hiding their own draft/
+        # proposed contracts (e.g. a freshly uploaded draft would never appear).
+        from src.common.authorization import is_user_feature_admin
         user_groups = current_user.groups if current_user else []
-        is_admin = is_user_admin(user_groups, settings)
+        is_admin = await is_user_feature_admin(
+            user_email=current_user.email if current_user else None,
+            user_groups=user_groups,
+            feature_id='data-contracts',
+            request=request,
+        )
 
         logger.info(
             f"User {current_user.email if current_user else 'unknown'} fetching contracts "
@@ -141,9 +152,11 @@ async def get_contracts(
                     "falling back to consumer visibility"
                 )
 
+        domain_ids_list = [d.strip() for d in domain_ids.split(",") if d.strip()] if domain_ids else None
         result = manager.list_contracts_from_db(
             db,
             domain_id=domain_id,
+            domain_ids=domain_ids_list,
             project_id=project_id,
             status=status,
             is_admin=is_admin,

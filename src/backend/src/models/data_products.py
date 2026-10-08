@@ -86,8 +86,18 @@ class AuthoritativeDefinition(BaseModel):
 class CustomProperty(BaseModel):
     """ODPS v1.0.0 Custom Property"""
     property: str = Field(..., description="Property name in camelCase")
-    value: Any = Field(..., description="Property value (can be any type)")
+    value: Any = Field(None, description="Property value (can be any type, including null)")
     description: Optional[str] = Field(None, description="Optional description")
+
+    # Normalize the legacy literal string "null" back to None. Older writes
+    # persisted a null value via json.dumps(None) == "null" (fixed on the write
+    # side), so this keeps values read from those rows presenting as real nulls
+    # instead of the four-character string.
+    @field_validator('value', mode='before')
+    def normalize_null_value(cls, v):
+        if v == "null":
+            return None
+        return v
 
     model_config = {"from_attributes": True}
 
@@ -342,7 +352,9 @@ class DataProduct(BaseModel):
     # ODPS v1.0.0 optional fields
     name: Optional[str] = Field(None, description="Name of the data product")
     version: Optional[str] = Field(None, description="Version of the data product")
-    domain: Optional[str] = Field(None, description="Business domain")
+    domain: Optional[str] = Field(None, description="Primary business domain name (populated by the manager)")
+    domain_ids: List[str] = Field(default_factory=list, description="Assigned data domain IDs (primary first)")
+    primary_domain_id: Optional[str] = Field(None, description="Primary data domain ID")
     tenant: Optional[str] = Field(None, description="Organization identifier")
     owner_team_id: Optional[str] = Field(None, description="Owner team UUID")
     owner_team_name: Optional[str] = Field(None, description="Owner team name (resolved at query time)")
@@ -518,7 +530,9 @@ class DataProductCreate(BaseModel):
     # ODPS optional
     name: Optional[str] = Field(None, description="Product name")
     version: Optional[str] = Field(None, description="Product version")
-    domain: Optional[str] = Field(None, description="Domain")
+    domain: Optional[str] = Field(None, description="Legacy single domain (name or ID); prefer domain_ids")
+    domain_ids: Optional[List[str]] = Field(None, description="Assigned data domain IDs (primary included)")
+    primary_domain_id: Optional[str] = Field(None, description="Primary data domain ID")
     tenant: Optional[str] = Field(None, description="Tenant")
     owner_team_id: Optional[str] = Field(None, description="Owner team UUID")
     project_id: Optional[str] = Field(None, description="Project association")
@@ -598,6 +612,8 @@ class DataProductUpdate(BaseModel):
     version: Optional[str] = None
     status: Optional[str] = None
     domain: Optional[str] = None
+    domain_ids: Optional[List[str]] = None
+    primary_domain_id: Optional[str] = None
     tenant: Optional[str] = None
     owner_team_id: Optional[str] = None
     project_id: Optional[str] = None

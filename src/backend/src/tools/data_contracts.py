@@ -49,25 +49,40 @@ class SearchDataContractsTool(BaseTool):
         
         try:
             from src.db_models.data_contracts import DataContractDb
-            
+            from src.repositories.entity_domain_association_repository import entity_domain_repo
+
             contracts_db = ctx.db.query(DataContractDb).limit(500).all()
             logger.debug(f"[search_data_contracts] Found {len(contracts_db)} total contracts in database")
-            
+
             if not contracts_db:
                 return ToolResult(
                     success=True,
                     data={"contracts": [], "total_found": 0, "message": "No data contracts found"}
                 )
-            
+
+            # Batch-load domain assignments (domain moved to the junction table).
+            domains_map = entity_domain_repo.get_domains_for_entities(
+                ctx.db, entity_type="data_contract", entity_ids=[str(c.id) for c in contracts_db]
+            )
+            contract_domain_names: Dict[str, List[str]] = {
+                cid: [a.domain_name for a in assigned if a.domain_name]
+                for cid, assigned in domains_map.items()
+            }
+            contract_primary_domain: Dict[str, Optional[str]] = {
+                cid: next((a.domain_name for a in assigned if a.is_primary), None)
+                for cid, assigned in domains_map.items()
+            }
+
             query_lower = query.lower() if query and query != '*' else ''
             filtered = []
-            
+
             for c in contracts_db:
+                c_domain_names = contract_domain_names.get(str(c.id), [])
                 if not query_lower:
                     include = True
                 else:
                     name_match = query_lower in (c.name or "").lower()
-                    
+
                     desc_match = False
                     if c.description:
                         try:
@@ -79,16 +94,16 @@ class SearchDataContractsTool(BaseTool):
                                 desc_match = query_lower in desc_dict.lower()
                         except Exception:
                             pass
-                    
-                    domain_match = query_lower in (c.domain or "").lower()
+
+                    domain_match = any(query_lower in (n or "").lower() for n in c_domain_names)
                     include = name_match or desc_match or domain_match
-                
+
                 if include:
-                    if domain and c.domain and c.domain.lower() != domain.lower():
+                    if domain and not any(n.lower() == domain.lower() for n in c_domain_names):
                         continue
                     if status and c.status != status:
                         continue
-                    
+
                     desc_purpose = None
                     if c.description:
                         try:
@@ -97,11 +112,11 @@ class SearchDataContractsTool(BaseTool):
                                 desc_purpose = desc_dict.get('purpose')
                         except Exception:
                             pass
-                    
+
                     filtered.append({
                         "id": str(c.id),
                         "name": c.name,
-                        "domain": c.domain,
+                        "domain": contract_primary_domain.get(str(c.id)),
                         "description": desc_purpose,
                         "status": c.status,
                         "version": c.version
@@ -146,15 +161,22 @@ class GetDataContractTool(BaseTool):
         
         try:
             from src.db_models.data_contracts import DataContractDb
-            
+            from src.repositories.entity_domain_association_repository import entity_domain_repo
+
             contract = ctx.db.query(DataContractDb).filter(DataContractDb.id == contract_id).first()
-            
+
             if not contract:
                 return ToolResult(
                     success=False,
                     error=f"Data contract '{contract_id}' not found"
                 )
-            
+
+            # Domain now lives in the entity_domain_associations junction; use the primary.
+            assigned = entity_domain_repo.get_domains_for_entity(
+                ctx.db, entity_type="data_contract", entity_id=str(contract.id)
+            )
+            primary_domain = next((a.domain_name for a in assigned if a.is_primary), None)
+
             desc_purpose = None
             if contract.description:
                 try:
@@ -163,14 +185,14 @@ class GetDataContractTool(BaseTool):
                         desc_purpose = desc_dict.get('purpose')
                 except Exception:
                     pass
-            
+
             logger.info(f"[get_data_contract] SUCCESS: Found contract {contract_id}")
             return ToolResult(
                 success=True,
                 data={
                     "id": str(contract.id),
                     "name": contract.name,
-                    "domain": contract.domain,
+                    "domain": primary_domain,
                     "description": desc_purpose,
                     "status": contract.status,
                     "version": contract.version,
@@ -455,90 +477,92 @@ class UpdateDataContractTool(BaseTool):
 
 
 class SearchDataContractsTool(BaseTool):
-    """Search for data contracts by name, domain, or keywords."""
-    
+    """Search for data contracts via the shared, tokenized search index."""
+
     name = "search_data_contracts"
     category = "data_contracts"
-    description = "Search for data contracts by name, domain, description, or keywords."
+    description = (
+        "Search data contracts by name, domain, description or tags. Use FEW BROAD "
+        "terms, not full sentences — each term is matched independently and results are "
+        "ranked by relevance. Narrow with the 'domain'/'status' filters and page with "
+        "'offset' instead of broadening the query. Leave 'query' empty (or '*') to list "
+        "contracts; the response is always paginated and includes 'total_count', "
+        "'has_more' and 'facets' so you can refine rather than fetch everything."
+    )
     parameters = {
         "query": {
             "type": "string",
-            "description": "Search query for data contracts"
+            "description": "Search terms (e.g., 'orders', 'customer'). Empty or '*' lists all contracts."
         },
         "domain": {
             "type": "string",
-            "description": "Optional filter by domain"
+            "description": "Optional filter by domain."
         },
         "status": {
             "type": "string",
             "enum": ["draft", "active", "deprecated"],
-            "description": "Optional filter by status"
+            "description": "Optional filter by status."
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max results to return (default: 25, max: 100)."
+        },
+        "offset": {
+            "type": "integer",
+            "description": "Number of results to skip for pagination (default: 0)."
         }
     }
     required_params = ["query"]
     required_scope = "contracts:read"
-    
+
     async def execute(
         self,
         ctx: ToolContext,
-        query: str,
+        query: str = "",
         domain: Optional[str] = None,
-        status: Optional[str] = None
+        status: Optional[str] = None,
+        limit: int = 25,
+        offset: int = 0,
     ) -> ToolResult:
-        """Search for data contracts."""
-        logger.info(f"[search_data_contracts] Starting - query='{query}', domain={domain}, status={status}")
-        
+        """Search data contracts over the shared in-memory index."""
+        logger.info(
+            f"[search_data_contracts] Starting - query='{query}', domain={domain}, "
+            f"status={status}, limit={limit}, offset={offset}"
+        )
+
+        if not ctx.search_manager:
+            logger.warning("[search_data_contracts] FAILED: search_manager is None")
+            return ToolResult(success=False, error="Search not available", data={"contracts": []})
+
         try:
-            # Query the DB directly: DataContractsManager.list_contracts()
-            # reads a legacy in-memory dict that is never populated, so the
-            # tool always returned zero contracts.
-            from src.db_models.data_contracts import DataContractDb
-            contracts = ctx.db.query(DataContractDb).limit(500).all()
-            
-            query_lower = query.lower() if query and query != '*' else ''
-            filtered = []
-            
-            for c in contracts:
-                # Filter by query
-                if query_lower:
-                    name_match = query_lower in (c.name or "").lower()
-                    domain_match = query_lower in (getattr(c, 'domain', '') or "").lower()
-                    desc_text = str(getattr(c, 'description_purpose', None) or getattr(c, 'description', '') or '')
-                    desc_match = query_lower in desc_text.lower()
-                    include = name_match or domain_match or desc_match
-                else:
-                    include = True
-                
-                if not include:
-                    continue
-                
-                # Apply filters
-                if domain and getattr(c, 'domain', None) and getattr(c, 'domain', '').lower() != domain.lower():
-                    continue
-                if status and c.status != status:
-                    continue
-                
-                filtered.append({
-                    "id": str(c.id),
-                    "name": c.name,
-                    "domain": getattr(c, 'domain', None) or getattr(c, 'domain_id', None),
-                    "status": c.status,
-                    "version": getattr(c, 'version', None),
-                    "format": getattr(c, 'format', None)
-                })
-            
-            logger.info(f"[search_data_contracts] SUCCESS: Found {len(filtered)} matching contracts")
+            data = ctx.search_manager.query_index(
+                query,
+                type_filter="data-contract",
+                filters={"domain": domain, "status": status},
+                limit=limit,
+                offset=offset,
+            )
+            logger.info(
+                f"[search_data_contracts] SUCCESS: returned {data['returned']} of "
+                f"{data['total_count']} matching contracts"
+            )
             return ToolResult(
                 success=True,
                 data={
-                    "contracts": filtered[:20],
-                    "total_found": len(filtered)
-                }
+                    "contracts": data["results"],
+                    "total_found": data["total_count"],
+                    "returned": data["returned"],
+                    "offset": data["offset"],
+                    "limit": data["limit"],
+                    "has_more": data["has_more"],
+                    "facets": data["facets"],
+                    "query": query,
+                },
             )
-            
+
         except Exception as e:
-            logger.error(f"[search_data_contracts] FAILED: {type(e).__name__}: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"{type(e).__name__}: {str(e)}")
+            logger.error(f"[search_data_contracts] FAILED: {e.__class__.__name__}: {e}", exc_info=True)
+            return ToolResult(success=False, error=f"{e.__class__.__name__}: {str(e)}", data={"contracts": []})
 
 
 class GetDataContractTool(BaseTool):

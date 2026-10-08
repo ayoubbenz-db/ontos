@@ -222,17 +222,26 @@ class AppEntityLoader(EntityLoader):
         if 'data_product' in entity_types:
             try:
                 from src.repositories.data_products_repository import data_product_repo
+                from src.repositories.entity_domain_association_repository import entity_domain_repo
                 # is_admin: the products repo is fail-closed per caller scope;
                 # compliance evaluates system-wide and its route is already
                 # permission-checked, so it must see every product.
-                for product in data_product_repo.get_multi(self.db, limit=1000, is_admin=True):
+                products = data_product_repo.get_multi(self.db, limit=1000, is_admin=True)
+                # Domain moved to the entity_domain_associations junction; batch-load the
+                # primary domain name per product (the legacy `domain` column was dropped).
+                domains_map = entity_domain_repo.get_domains_for_entities(
+                    self.db, entity_type="data_product", entity_ids=[str(p.id) for p in products]
+                ) if products else {}
+                for product in products:
+                    assigned = domains_map.get(str(product.id), [])
+                    primary_domain = next((a.domain_name for a in assigned if a.is_primary), None)
                     yield {
                         'type': 'data_product',
                         'id': product.id,
                         'name': product.name,
                         'description': getattr(product, 'description_purpose', None)
                                        or getattr(product, 'description', None),
-                        'domain': getattr(product, 'domain', None),
+                        'domain': primary_domain,
                         'status': product.status,
                         'version': getattr(product, 'version', None),
                         'owner': getattr(product, 'owner_team_id', None),
